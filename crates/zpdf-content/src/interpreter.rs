@@ -45,7 +45,6 @@ pub struct ContentInterpreter<'a> {
     /// Document whose shared font cache form and ExtGState fonts load through
     /// (see [`Self::with_shared_fonts`]).
     shared_font_doc: Option<&'a zpdf_document::PdfDocument>,
-    current_font_id: Option<zpdf_font::FontId>,
     file: Option<&'a PdfFile>,
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
@@ -528,6 +527,13 @@ struct GraphicsState {
     dash: Option<DashPattern>,
     font_name: String,
     font_size: f32,
+    /// Resolved id of the font selected by `Tf`. The text state is part of the
+    /// graphics state (PDF 32000-1 §9.3), so `q`/`Q` must save and restore it:
+    /// otherwise a `Tf` issued inside `q … Q` keeps drawing subsequent runs
+    /// that rely on the ambient font (no `Tf` of their own) with the wrong
+    /// face — e.g. body text shown through the math font selected for one
+    /// italic letter.
+    font_id: Option<zpdf_font::FontId>,
     char_spacing: f32,
     word_spacing: f32,
     h_scaling: f32,
@@ -576,6 +582,7 @@ impl Default for GraphicsState {
             dash: None,
             font_name: String::new(),
             font_size: 12.0,
+            font_id: None,
             char_spacing: 0.0,
             word_spacing: 0.0,
             h_scaling: 100.0,
@@ -668,7 +675,6 @@ impl<'a> ContentInterpreter<'a> {
             text_clip_unavailable: false,
             font_cache: None,
             shared_font_doc: None,
-            current_font_id: None,
             file: None,
             resources: None,
             image_cache: None,
@@ -1602,11 +1608,11 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.font_name = name.clone();
                 self.current.font_size = size;
                 // An unresolvable font must not leave the previous one active.
-                self.current_font_id = None;
+                self.current.font_id = None;
                 let lookup_name = self.resolve_font_name(&name);
                 if let Some(fc) = self.font_cache.as_ref() {
                     if let Some((fid, _font)) = fc.get_by_name(&lookup_name) {
-                        self.current_font_id = Some(fid);
+                        self.current.font_id = Some(fid);
                     }
                 }
             }
@@ -4517,7 +4523,7 @@ impl<'a> ContentInterpreter<'a> {
         let name = format!("__font_{}_{}", font_ref.0, font_ref.1);
         self.current.font_name = name.clone();
         self.current.font_size = size;
-        self.current_font_id = None;
+        self.current.font_id = None;
         let (Some(file), Some(fc)) = (self.file, self.font_cache.as_mut()) else {
             return;
         };
@@ -4534,7 +4540,7 @@ impl<'a> ContentInterpreter<'a> {
                 );
             }
         }
-        self.current_font_id = fc.get_by_name(&name).map(|(fid, _)| fid);
+        self.current.font_id = fc.get_by_name(&name).map(|(fid, _)| fid);
     }
 
     fn resolve_font_name(&self, name: &str) -> String {
@@ -5355,16 +5361,16 @@ impl<'a> ContentInterpreter<'a> {
     where
         I: Iterator<Item = &'b [u8]>,
     {
-        let current = self.current_font_id?;
+        let current = self.current.font_id?;
         let cache = self.font_cache.as_deref()?;
         let target = self.font_repair.leaked_font(cache, current, strings)?;
         self.font_override = true;
-        Some(self.current_font_id.replace(target))
+        Some(self.current.font_id.replace(target))
     }
 
     fn restore_font(&mut self, restore: Option<Option<zpdf_font::FontId>>) {
         if let Some(previous) = restore {
-            self.current_font_id = previous;
+            self.current.font_id = previous;
             self.font_override = false;
         }
     }
@@ -5381,7 +5387,7 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn show_text(&mut self, bytes: &[u8]) {
-        if !bytes.is_empty() && self.current_font_id.is_none() && !self.oc_suppressed() {
+        if !bytes.is_empty() && self.current.font_id.is_none() && !self.oc_suppressed() {
             self.stats.diagnostics.missing_resources =
                 self.stats.diagnostics.missing_resources.saturating_add(1);
         }
@@ -5398,7 +5404,7 @@ impl<'a> ContentInterpreter<'a> {
         let word_spacing = self.current.word_spacing;
         let want_text = self.text_sink.is_some();
 
-        let font_and_id = self.current_font_id.and_then(|fid| {
+        let font_and_id = self.current.font_id.and_then(|fid| {
             self.font_cache
                 .as_ref()
                 .and_then(|fc| fc.get(fid).map(|f| (fid, f)))
@@ -5633,7 +5639,7 @@ impl<'a> ContentInterpreter<'a> {
             && !cs_produces_no_marks(&self.current.fill_cs)
             && !repair;
         if ordinary {
-            if let Some(font_id) = self.current_font_id {
+            if let Some(font_id) = self.current.font_id {
                 if !glyphs.is_empty() {
                     self.emit_solid_glyph_run(font_id, font_size, glyphs, combined, h_scale);
                 }
@@ -5673,7 +5679,8 @@ impl<'a> ContentInterpreter<'a> {
         repair: bool,
     ) {
         let resolved_runs = self
-            .current_font_id
+            .current
+            .font_id
             .and_then(|font_id| self.resolve_text_glyphs(font_id, bytes, &mut glyphs, repair));
 
         // Only emit a glyph run when a font is actually active; with no font the
@@ -5703,7 +5710,7 @@ impl<'a> ContentInterpreter<'a> {
         };
         let wants_clip = matches!(self.current.render_mode, 4..=7);
         // No font at all leaves the shown codes without any outline source.
-        let mut outlines_unavailable = self.current_font_id.is_none();
+        let mut outlines_unavailable = self.current.font_id.is_none();
         // Per resolved run: true when its font has no outlines to clip with.
         let mut outline_less_runs: Vec<bool> = Vec::new();
         let glyph_clip = if wants_clip || text_pattern.is_some() {
@@ -5744,7 +5751,7 @@ impl<'a> ContentInterpreter<'a> {
                     .iter()
                     .map(|(font_id, glyphs)| !append(*font_id, glyphs))
                     .collect();
-            } else if let Some(font_id) = self.current_font_id {
+            } else if let Some(font_id) = self.current.font_id {
                 append(font_id, &glyphs);
             }
             union
@@ -5760,7 +5767,7 @@ impl<'a> ContentInterpreter<'a> {
                     .extend_from_path(path);
             }
         }
-        if let Some(font_id) = self.current_font_id {
+        if let Some(font_id) = self.current.font_id {
             if (!glyphs.is_empty() || resolved_runs.is_some()) && !invisible {
                 if matches!(self.current.render_mode, 1 | 2 | 5 | 6) {
                     if let Some(runs) = resolved_runs {
@@ -6005,7 +6012,8 @@ impl<'a> ContentInterpreter<'a> {
         // Per PDF 9.4.4 it moves tx (scaled by Th) in horizontal mode but ty
         // (no Th factor) in vertical writing mode.
         let vertical = self
-            .current_font_id
+            .current
+            .font_id
             .and_then(|fid| self.font_cache.as_ref().and_then(|fc| fc.get(fid)))
             .and_then(|f| f.cid_cmap.as_ref())
             .map(|c| c.wmode == 1)
@@ -6906,6 +6914,30 @@ mod tests {
         let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
         let dl = ContentInterpreter::new(page_rect).interpret(content);
         assert_eq!(dl.commands.len(), 2);
+    }
+
+    /// `Tf` sets text state, and text state is part of the graphics state
+    /// (PDF 32000-1 §9.3), so `Q` must put the outer font back. Producers rely
+    /// on it: a math/italic face selected inside `q … Q` for a single glyph is
+    /// otherwise still active for the following runs, which carry no `Tf` of
+    /// their own and would be drawn with the wrong face.
+    #[test]
+    fn save_restore_round_trips_the_selected_font() {
+        let saved = GraphicsState {
+            font_name: "F1".to_owned(),
+            font_id: Some(1),
+            ..GraphicsState::default()
+        };
+        // `q` pushes exactly this state; `Tf` inside the block retargets the
+        // font; `Q` pops it again.
+        let mut inner = saved.clone();
+        inner.font_name = "F2".to_owned();
+        inner.font_id = Some(2);
+
+        // The pushed copy is what `Q` restores — unaffected by the block.
+        assert_eq!(inner.font_id, Some(2));
+        assert_eq!(saved.font_name, "F1");
+        assert_eq!(saved.font_id, Some(1));
     }
 
     // ---- Text clipping (render modes 4–7) ----
